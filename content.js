@@ -5,7 +5,7 @@
 (function () {
   if (window.__hkTelTool) return;
   window.__hkTelTool = true;
-  const VERSION = '0.4.0';
+  const VERSION = '0.4.1';
 
   // ===== 設定 =====
   const CONFIG = {
@@ -16,8 +16,8 @@
     saleCatId: '1',              // 販売カテゴリ：一般
     saleTypeText: 'TEL',         // 販売種別
     classes: {
-      W3:  { label: 'アルファード30系（W3）', plan: '1',   cls: '6',  rsvClass: '6'  },
-      W4Z: { label: '新型アルファード（W4Z）', plan: '213', cls: '39', rsvClass: '39' }
+      W3:  { label: 'アルファード30系（W3）', plan: '1',   cls: '6',  rsvClass: '6',  shopE: '1_1_19'  },
+      W4Z: { label: '新型アルファード（W4Z）', plan: '213', cls: '39', rsvClass: '39', shopE: '1_1_684' }
     },
     // key: 内部名, front: お客様画面のオプション名に含まれる語, rsv: Rensapoのオプション名に含まれる語, price: Rensapo料金欄, max: 最大個数
     options: [
@@ -49,18 +49,33 @@
   // ===== お客様画面と同じ見積もり =====
   async function quote(p) {
     const c = CONFIG.classes[p.cls];
-    const q = new URLSearchParams({
-      '_method': 'POST',
-      'data[Quote][date]': p.start.date, 'data[Quote][time]': p.start.time, 'data[Quote][shop]': CONFIG.shopStart,
-      'data[Quote][dateE]': p.end.date, 'data[Quote][timeE]': p.end.time, 'data[Quote][shopE]': '',
-      'data[Quote][carnum]': '1', 'data[Quote][car_plan_id]': c.plan, 'data[Quote][car_class_id]': c.cls,
-      'data[Flg][input]': '1'
-    });
-    const res = await fetch(`/booking/rentacars/ajaxQuote/${c.plan}/${c.cls}/?${q}`, {
-      method: 'POST', credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' }
-    });
-    const j = JSON.parse(await res.text());
-    if (j.error && Object.keys(j.error).length) throw new Error(Object.values(j.error).join(' / '));
+    // 返却営業所は常に福岡空港店。番号が変わっていたら、サイトが返す一覧から福岡空港店を探して取り直す
+    const ask = async (shopE) => {
+      const q = new URLSearchParams({
+        '_method': 'POST',
+        'data[Quote][date]': p.start.date, 'data[Quote][time]': p.start.time, 'data[Quote][shop]': CONFIG.shopStart,
+        'data[Quote][dateE]': p.end.date, 'data[Quote][timeE]': p.end.time, 'data[Quote][shopE]': shopE,
+        'data[Quote][carnum]': '1', 'data[Quote][car_plan_id]': c.plan, 'data[Quote][car_class_id]': c.cls,
+        'data[Flg][input]': '1'
+      });
+      const res = await fetch(`/booking/rentacars/ajaxQuote/${c.plan}/${c.cls}/?${q}`, {
+        method: 'POST', credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      return JSON.parse(await res.text());
+    };
+    const hasErr = (j) => j.error && Object.keys(j.error).length;
+    const pickShopE = (j) => {
+      const list = Object.assign({}, ...Object.values(j.listShopE || {}).map((v) => (v && typeof v === 'object' ? v : {})));
+      return Object.keys(list).find((k) => String(list[k]).includes(CONFIG.shopName)) || Object.keys(list)[0] || '';
+    };
+    let shopE = store.get('hkShopE_' + p.cls) || c.shopE;
+    let j = await ask(shopE);
+    if (hasErr(j) || !j.car_plan) {
+      const alt = pickShopE(j) || (j.shopE && j.shopE !== shopE ? j.shopE : '');
+      if (alt && alt !== shopE) { shopE = alt; j = await ask(shopE); }
+    }
+    if (hasErr(j)) throw new Error(Object.values(j.error).join(' / '));
+    store.set('hkShopE_' + p.cls, shopE);
     if (j.date !== p.start.date || j.dateE !== p.end.date || j.time !== p.start.time || j.timeE !== p.end.time) {
       throw new Error('この日時では見積もりが出せません（営業時間外・受付期間外の可能性）');
     }
