@@ -1,32 +1,34 @@
 /* ハコレン 電話受付ツール 本体（GitHubから自動読み込み）
  * Rensapo 新規予約画面で動作。登録ボタンは絶対に押さない（人が確認して押す）。
+ * 流れ：① 見積もり（日時・車種・オプション）→ ② お客様情報（電話で会員検索・名前・メール）→ ③ Rensapoに入力
  */
 (function () {
   if (window.__hkTelTool) return;
   window.__hkTelTool = true;
-  const VERSION = '0.2.0';
+  const VERSION = '0.4.0';
 
   // ===== 設定 =====
   const CONFIG = {
     open: '09:00', close: '19:00', pickupLast: '18:30',
     manyHits: 5,                 // これより多くヒットしたら会社・店舗番号とみなす
-    shopStart: '1_1',            // 福岡空港店（フロント側）
+    shopStart: '1_1',            // 福岡空港店（お客様画面側）
+    shopName: '福岡空港',         // Rensapo の店舗選択で使う名前（自動で選ぶ）
     saleCatId: '1',              // 販売カテゴリ：一般
     saleTypeText: 'TEL',         // 販売種別
     classes: {
-      W3:  { label: 'アルファード30系（福岡W3）',  plan: '1',   cls: '6',  rsvClass: '6'  },
-      W4Z: { label: '新型アルファード（福岡W4Z）', plan: '213', cls: '39', rsvClass: '39' }
+      W3:  { label: 'アルファード30系（W3）', plan: '1',   cls: '6',  rsvClass: '6'  },
+      W4Z: { label: '新型アルファード（W4Z）', plan: '213', cls: '39', rsvClass: '39' }
     },
-    // key: 内部名, front: フロントのオプション名に含まれる語, rsv: Rensapoのオプション名に含まれる語, price: Rensapo料金欄
+    // key: 内部名, front: お客様画面のオプション名に含まれる語, rsv: Rensapoのオプション名に含まれる語, price: Rensapo料金欄, max: 最大個数
     options: [
-      { key: 'menseki', label: '免責補償',   front: '免責補償オプション', rsv: '免責補償', price: 'price2' },
-      { key: 'wide',    label: 'ワイド補償', front: 'ワイド',             rsv: 'ワイド',   price: 'price3' },
-      { key: 'irekae',  label: '入替補償',   front: '入替',               rsv: '入替',     price: 'price9' },
-      { key: 'etc',     label: 'ETCカード',  front: 'ETCカード',          rsv: 'ETC',      price: 'price7' },
-      { key: 'child',   label: 'チャイルドシート', front: 'チャイルド', rsv: 'チャイルド', price: 'price7' },
-      { key: 'baby',    label: 'ベビーシート',     front: 'ベビー',     rsv: 'ベビー',     price: 'price7' },
-      { key: 'junior',  label: 'ジュニアシート',   front: 'ジュニア',   rsv: 'ジュニア',   price: 'price7' },
-      { key: 'kep',     label: 'KEP',              front: 'KEP',        rsv: 'KEP',        price: 'price7' }
+      { key: 'menseki', label: '免責補償',         front: '免責補償オプション', rsv: '免責補償',   price: 'price2', max: 1, group: 'hosho' },
+      { key: 'wide',    label: 'ワイド補償',       front: 'ワイド',             rsv: 'ワイド',     price: 'price3', max: 1, group: 'hosho' },
+      { key: 'irekae',  label: '安心入替補償',     front: '入替',               rsv: '入替',       price: 'price9', max: 1, group: 'hosho' },
+      { key: 'etc',     label: 'ETCカード',        front: 'ETCカード',          rsv: 'ETC',        price: 'price7', max: 1, group: 'opt' },
+      { key: 'child',   label: 'チャイルドシート', front: 'チャイルド',         rsv: 'チャイルド', price: 'price7', max: 3, group: 'opt' },
+      { key: 'baby',    label: 'ベビーシート',     front: 'ベビー',             rsv: 'ベビー',     price: 'price7', max: 3, group: 'opt' },
+      { key: 'junior',  label: 'ジュニアシート',   front: 'ジュニア',           rsv: 'ジュニア',   price: 'price7', max: 3, group: 'opt' },
+      { key: 'kep',     label: 'KEP',              front: 'KEP',                rsv: 'KEP',        price: 'price7', max: 1, group: 'opt' }
     ]
   };
 
@@ -34,95 +36,17 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const yen = (n) => Number(n || 0).toLocaleString('ja-JP') + '円';
   const pad = (n) => String(n).padStart(2, '0');
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const hira2kata = (s) => String(s || '').replace(/[ぁ-ゖ]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0x60));
+  const isKana = (s) => /^[ぁ-ゖァ-ーー\s]+$/.test(s || '');
   const store = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
   };
+  const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const TIMES = (() => { const a = []; for (let m = 9 * 60; m <= 19 * 60; m += 30) a.push(`${pad(Math.floor(m / 60))}:${pad(m % 60)}`); return a; })();
 
-  // ===== 文章の読み取り =====
-  function toHalf(s) {
-    return s.normalize('NFKC').replace(/[‐－―ー−]/g, (m) => (m === 'ー' ? m : '-'));
-  }
-  function hira2kata(s) { return s.replace(/[ぁ-ゖ]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0x60)); }
-
-  function parse(text) {
-    const warn = [];
-    let s = toHalf(text).replace(/\s+/g, ' ');
-    const r = { warn };
-
-    // 日付＋時刻（例: 10/25 9時, 10月25日 9:30, 10/25 9時半）
-    const re = /(\d{1,2})\s*[\/月]\s*(\d{1,2})\s*日?\s*(?:(\d{1,2})\s*(?::\s*(\d{2})|時\s*(半|\d{1,2}(?=\s*分))?\s*分?))?/g;
-    const found = [];
-    let m;
-    while ((m = re.exec(s)) && found.length < 2) {
-      let h = m[3] != null ? Number(m[3]) : null;
-      let min = 0;
-      if (m[4]) min = Number(m[4]);
-      else if (m[5] === '半') min = 30;
-      else if (m[5]) min = Number(m[5]);
-      found.push({ mo: Number(m[1]), d: Number(m[2]), h, min, raw: m[0] });
-    }
-    found.forEach((f) => { s = s.replace(f.raw, ' '); });
-    if (found.length < 2) warn.push('出発日と返却日の2つの日付が読み取れません（例: 10/25 9時 10/26 15時）');
-
-    const today = new Date();
-    const mk = (f, label) => {
-      if (!f) return null;
-      let y = today.getFullYear();
-      const dt = new Date(y, f.mo - 1, f.d);
-      if (dt < new Date(today.getFullYear(), today.getMonth(), today.getDate()) - 1) y += 1;
-      if (f.h == null) { warn.push(label + 'の時刻がありません'); return { date: `${y}-${pad(f.mo)}-${pad(f.d)}`, time: '' }; }
-      let h = f.h;
-      if (h < 8) { h += 12; warn.push(`${label}の時刻を ${f.h}時 → ${h}時 と解釈しました`); }
-      return { date: `${y}-${pad(f.mo)}-${pad(f.d)}`, time: `${pad(h)}:${pad(f.min)}` };
-    };
-    r.start = mk(found[0], '出発');
-    r.end = mk(found[1], '返却');
-    [['出発', r.start], ['返却', r.end]].forEach(([lb, v]) => {
-      if (v && v.time && (v.time < CONFIG.open || v.time > CONFIG.close)) warn.push(`${lb}時刻 ${v.time} は営業時間（${CONFIG.open}〜${CONFIG.close}）外です`);
-      if (v && v.time && v.time > CONFIG.pickupLast) warn.push(`${lb}時刻 ${v.time} は送迎最終（${CONFIG.pickupLast}）より後です`);
-    });
-    if (r.start && r.end && (r.start.date + r.start.time) >= (r.end.date + r.end.time)) warn.push('返却日時が出発日時より前になっています');
-
-    // 電話番号
-    const tm = s.match(/0\d{1,4}[- ]?\d{1,4}[- ]?\d{3,4}/);
-    if (tm && tm[0].replace(/\D/g, '').length >= 10) {
-      r.tel = tm[0].replace(/\D/g, '');
-      s = s.replace(tm[0], ' ');
-    } else warn.push('電話番号が読み取れません');
-
-    // 車種クラス
-    if (/W4Z|新型|40系|アルファード\s*Z|アルファード\s*40|40\s*アルファード/i.test(s)) r.cls = 'W4Z';
-    else if (/W3|30系|アルファード\s*30|30\s*アルファード/i.test(s)) r.cls = 'W3';
-    else if (/アルファード/.test(s)) { r.cls = 'W3'; warn.push('型式の指定がないため 30系（W3）にしました'); }
-    else warn.push('車種が読み取れません（例: アルファード30 / 新型アルファード）');
-    s = s.replace(/W4Z|W3|新型|40系|30系|アルファード\s*(Z|30|40)?|(30|40)\s*アルファード/gi, ' ');
-
-    // オプション
-    r.opts = {};
-    const cnt = (re2) => { const mm = s.match(re2); return mm ? Number(mm[2] || 1) : 0; };
-    if (/ワイド/.test(s)) r.opts.wide = 1;
-    if (/(^|[^ド])(免責|面積|めんせき)/.test(s.replace(/ワイド\s*(免責|面積)/g, 'ワイド'))) r.opts.menseki = 1;
-    if (/入替|入れ替え|入れ替|いれかえ/.test(s)) r.opts.irekae = 1;
-    if (/ETC/i.test(s)) r.opts.etc = 1;
-    if (/KEP/i.test(s)) r.opts.kep = 1;
-    const c = cnt(/(チャイルド\S*?)(\d)?(個|台)?/); if (c) r.opts.child = /チャイルド\S*?(\d)/.test(s) ? Number(s.match(/チャイルド\S*?(\d)/)[1]) : 1;
-    const b = cnt(/(ベビー\S*?)(\d)?/); if (b) r.opts.baby = /ベビー\S*?(\d)/.test(s) ? Number(s.match(/ベビー\S*?(\d)/)[1]) : 1;
-    const j = cnt(/(ジュニア\S*?)(\d)?/); if (j) r.opts.junior = /ジュニア\S*?(\d)/.test(s) ? Number(s.match(/ジュニア\S*?(\d)/)[1]) : 1;
-    s = s.replace(/から|まで|より|〜|~|名前|お名前|電話番号|電話|様|さん|系|安心|ワイド|免責|面積|めんせき|入替|入れ替え|入れ替|いれかえ|ETC\S*|KEP|チャイルド\S*|ベビー\S*|ジュニア\S*|保証|補償|オプション|カード|シート|\d+個|\d+台|なし/gi, ' ');
-
-    // 名前（残った文字）
-    const name = s.replace(/[、,。．.・:：]/g, ' ').replace(/\s+/g, ' ').trim();
-    if (name) {
-      const parts = name.split(' ');
-      r.name1 = parts[0];
-      r.name2 = parts.slice(1).join('');
-      if (/^[ぁ-ゖァ-ーー\s]+$/.test(name)) { r.kana1 = hira2kata(r.name1); r.kana2 = hira2kata(r.name2); }
-    }
-    return r;
-  }
-
-  // ===== フロント（お客様画面）と同じ見積もり =====
+  // ===== お客様画面と同じ見積もり =====
   async function quote(p) {
     const c = CONFIG.classes[p.cls];
     const q = new URLSearchParams({
@@ -136,16 +60,17 @@
       method: 'POST', credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' }
     });
     const j = JSON.parse(await res.text());
-    if (j.error && Object.keys(j.error).length) throw new Error('お客様画面の見積もりでエラー: ' + Object.values(j.error).join(' / '));
+    if (j.error && Object.keys(j.error).length) throw new Error(Object.values(j.error).join(' / '));
     if (j.date !== p.start.date || j.dateE !== p.end.date || j.time !== p.start.time || j.timeE !== p.end.time) {
-      throw new Error('見積もりの日時が入力と一致しません（営業時間外の可能性）');
+      throw new Error('この日時では見積もりが出せません（営業時間外・受付期間外の可能性）');
     }
     const base = Number(j.car_plan.CarVPlan.basic_price);
     const lines = [];
     for (const [k, n] of Object.entries(p.opts)) {
+      if (!n) continue;
       const def = CONFIG.options.find((o) => o.key === k);
       const ent = Object.entries(j.car_stock_options || {}).find(([, v]) => v.car_option_name.includes(def.front));
-      if (!ent) throw new Error(`「${def.label}」がこの車種のオプションにありません`);
+      if (!ent) throw new Error(`「${def.label}」はこの車種では選べません`);
       const prices = j.car_plan_stock_options[ent[0]] || [];
       if (prices[n] == null) throw new Error(`「${def.label}」を ${n} 個は選べません`);
       lines.push({ key: k, label: def.label, n, price: Number(prices[n]), field: def.price, rsv: def.rsv });
@@ -167,8 +92,8 @@
     (extra || []).forEach((ev) => e.trigger(ev));
     return true;
   };
-  function selectByText(sel, text) {
-    const o = [...document.querySelectorAll(sel + ' option')].find((x) => x.text.trim() === text);
+  function selectByText(sel, test) {
+    const o = [...document.querySelectorAll(sel + ' option')].find((x) => test(x.text.trim()));
     if (o) setv(sel, o.value);
     return !!o;
   }
@@ -177,21 +102,34 @@
     const all = [...t.matchAll(/合計\s*([\d,]+)\s*円/g)];
     return all.length ? Number(all[all.length - 1][1].replace(/,/g, '')) : null;
   }
+  const fmtTel = (t) => t.replace(/^(0\d0)(\d{4})(\d{4})$/, '$1-$2-$3');
 
-  async function fillRensapo(p, qt, memberId, staffId, log) {
-    // 販売種別
+  async function fillRensapo(p, qt, cust, staffId, log) {
+    // 販売種別・受付
     setv('#BookingSaleTypeCatId', CONFIG.saleCatId); await sleep(1200);
-    if (!selectByText('#BookingSaleTypeId', CONFIG.saleTypeText)) log('⚠ 販売種別「TEL」が見つかりません');
+    if (!selectByText('#BookingSaleTypeId', (t) => t === CONFIG.saleTypeText)) log('⚠ 販売種別「TEL」が見つかりません');
     if (staffId) setv('#BookingReserveUserId', staffId);
 
-    // 会員
-    if (memberId) { window.ajax_member_set(memberId); await sleep(1800); log('会員情報を読み込みました'); }
-    else {
-      setv('#MemberName1', p.name1 || ''); setv('#MemberName2', p.name2 || '');
-      if (p.kana1) { setv('#MemberKana1', p.kana1); setv('#MemberKana2', p.kana2 || ''); }
-      log('新規のお客様として名前を入力しました');
+    // 店舗は常に福岡空港店
+    ['#BookingReserveOfficeId', '#BookingOfficeStartId', '#BookingOfficeEndId'].forEach((sel) => {
+      if ($(sel).length && !selectByText(sel, (t) => t.includes(CONFIG.shopName))) log('⚠ 店舗「福岡空港店」が選べませんでした');
+    });
+
+    // お客様
+    if (cust.memberId) {
+      window.ajax_member_set(cust.memberId); await sleep(1800);
+      log('会員情報を読み込みました');
+    } else {
+      setv('#MemberName1', cust.name1); setv('#MemberName2', cust.name2);
+      setv('#MemberKana1', cust.kana1); setv('#MemberKana2', cust.kana2);
+      log('新規のお客様として入力しました');
     }
-    if (!$('#MemberTel').val()) setv('#MemberTel', p.tel.replace(/^(0\d0)(\d{4})(\d{4})$/, '$1-$2-$3'));
+    if (cust.tel && !$('#MemberTel').val()) setv('#MemberTel', fmtTel(cust.tel));
+    if (cust.email) {
+      const now = ($('#MemberEmail').val() || '').trim();
+      if (now && now !== cust.email) log(`メールアドレスを更新しました（前: ${now}）`);
+      setv('#MemberEmail', cust.email);
+    }
 
     // 日時
     setv('#BookingStartDay', p.start.date, ['changeDate', 'blur']);
@@ -205,8 +143,7 @@
     if (other) { setv('#BookingCarClassId', other); await sleep(1200); }
     setv('#BookingCarClassId', cls); setv('#RentalCarClassId', cls); await sleep(2500);
 
-    // オプション（Rensapo側）
-    // 車種変更の読み込みで欄が作り直されることがあるため、毎回探し直して反映を確認する
+    // オプション（車種変更で欄が作り直されることがあるので、毎回探し直して反映を確認）
     const labelOf = (s) => { let n = s, l = ''; for (let i = 0; i < 5 && !l; i++) { n = n.parentElement; l = (n.previousElementSibling?.innerText || '').trim(); } return l; };
     const optSelects = () => [...document.querySelectorAll('select[id^=BookingOption]')];
     const wantOpt = () => optSelects().map((s) => {
@@ -228,57 +165,101 @@
     qt.lines.forEach((l) => { want[l.field] += l.price; });
     for (let round = 0; round < 3; round++) {
       for (const [k, v] of Object.entries(want)) {
-        const e = $(`[name="data[PriceLending][${k}]"]`);
-        e.val(String(v)).trigger('keyup').trigger('change');
+        $(`[name="data[PriceLending][${k}]"]`).val(String(v)).trigger('keyup').trigger('change');
         await sleep(500);
       }
       await sleep(800);
-      const ok = Object.entries(want).every(([k, v]) => Number($(`[name="data[PriceLending][${k}]"]`).val()) === v);
-      if (ok) break;
+      if (Object.entries(want).every(([k, v]) => Number($(`[name="data[PriceLending][${k}]"]`).val()) === v)) break;
     }
-    const got = rsvTotal();
-    return { want, got };
+    return { want, got: rsvTotal() };
   }
 
   // ===== 画面（パネル） =====
   const css = `
-  #hkTel{position:fixed;right:12px;bottom:12px;z-index:99999;width:360px;max-height:90vh;overflow:auto;background:#fff;border:2px solid #1e88e5;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.25);font:14px/1.5 sans-serif;color:#222}
-  #hkTel header{background:#1e88e5;color:#fff;padding:8px 12px;font-weight:bold;display:flex;justify-content:space-between;cursor:pointer}
-  #hkTel .bd{padding:10px 12px}
-  #hkTel textarea{width:100%;height:70px;box-sizing:border-box;font-size:14px;padding:6px}
-  #hkTel select{width:100%;margin:4px 0}
-  #hkTel button{width:100%;padding:9px;margin-top:6px;font-size:15px;font-weight:bold;border:0;border-radius:6px;cursor:pointer}
-  #hkTel .b1{background:#43a047;color:#fff} #hkTel .b2{background:#fb8c00;color:#fff}
-  #hkTel button:disabled{background:#bbb}
-  #hkTel .out{margin-top:8px;font-size:13px} #hkTel table{width:100%;border-collapse:collapse}
+  #hkTel{position:fixed;right:12px;bottom:12px;z-index:99999;width:380px;max-height:92vh;overflow:auto;background:#fff;border:2px solid #1e88e5;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.25);font:14px/1.5 sans-serif;color:#222}
+  #hkTel header{position:sticky;top:0;background:#1e88e5;color:#fff;padding:8px 12px;font-weight:bold;display:flex;justify-content:space-between;cursor:pointer;z-index:1}
+  #hkTel .bd{padding:8px 12px 12px}
+  #hkTel h4{margin:10px 0 4px;font-size:14px;color:#1e88e5;border-bottom:1px solid #e3eefb;padding-bottom:2px}
+  #hkTel .row{display:flex;gap:6px;align-items:center;margin:4px 0}
+  #hkTel .row>label.k{width:40px;flex:none;color:#555}
+  #hkTel input[type=date],#hkTel input[type=text],#hkTel input[type=tel],#hkTel input[type=email],#hkTel select{font-size:14px;padding:3px 4px;border:1px solid #bbb;border-radius:4px;min-width:0}
+  #hkTel input[type=text],#hkTel input[type=tel],#hkTel input[type=email]{flex:1}
+  #hkTel .chips{display:flex;flex-wrap:wrap;gap:4px 10px}
+  #hkTel .chips label{white-space:nowrap;cursor:pointer}
+  #hkTel .cnt select{width:auto}
+  #hkTel button{padding:8px;font-size:14px;font-weight:bold;border:0;border-radius:6px;cursor:pointer}
+  #hkTel .wide{width:100%;margin-top:8px;font-size:15px}
+  #hkTel .b2{background:#fb8c00;color:#fff} #hkTel .bs{background:#e3eefb;color:#1e88e5;padding:4px 10px}
+  #hkTel button:disabled{background:#bbb;color:#fff}
+  #hkTel table{width:100%;border-collapse:collapse;margin-top:4px}
   #hkTel td{padding:2px 4px;border-bottom:1px solid #eee} #hkTel td:last-child{text-align:right}
-  #hkTel .tot{font-size:18px;font-weight:bold;color:#c62828}
-  #hkTel .warn{color:#c62828} #hkTel .ok{color:#2e7d32} #hkTel .hint{color:#777;font-size:12px}
+  #hkTel .tot td{font-size:20px;font-weight:bold;color:#c62828;border-bottom:0}
+  #hkTel .warn{color:#c62828;font-size:13px} #hkTel .ok{color:#2e7d32} #hkTel .hint{color:#777;font-size:12px}
+  #hkTel .sec[hidden]{display:none}
+  #hkTel .voice{display:flex;gap:4px;margin:4px 0}
+  #hkTel .voice input{flex:1}
+  #hkTel .mic{background:#e53935;color:#fff;padding:4px 10px;font-size:16px}
+  #hkTel .mic.on{animation:hkBlink 1s infinite}
+  @keyframes hkBlink{50%{opacity:.4}}
   #hkTel.min .bd{display:none}`;
   const st = document.createElement('style'); st.textContent = css; document.head.appendChild(st);
+
+  const timeOpts = TIMES.map((t) => `<option>${t}</option>`).join('');
+  const chk = (o) => o.max > 1
+    ? `<label class="cnt">${o.label} <select data-opt="${o.key}">${[0, 1, 2, 3].slice(0, o.max + 1).map((n) => `<option value="${n}">${n || '-'}</option>`).join('')}</select></label>`
+    : `<label><input type="checkbox" data-opt="${o.key}"> ${o.label}</label>`;
 
   const box = document.createElement('div');
   box.id = 'hkTel';
   box.innerHTML = `
     <header><span>📞 電話受付ツール <small>v${VERSION}</small></span><span id="hkMin">－</span></header>
     <div class="bd">
-      <div class="hint">例：10/25 9時 10/26 15時 アルファード30 ヤマダ タロウ 090-1234-5678 免責 ワイド 入替 ETC</div>
-      <textarea id="hkIn" placeholder="ここに予約内容を入力"></textarea>
-      <label>受付担当</label><select id="hkStaff"></select>
-      <button class="b1" id="hkQ">① 見積もり・会員検索</button>
-      <div class="out" id="hkOut"></div>
-      <button class="b2" id="hkF" disabled>② Rensapoに入力する</button>
-      <div class="out" id="hkLog"></div>
+      <h4>① 見積もり</h4>
+      <div class="voice"><input type="text" id="hkVoice" placeholder="🎤で話すか入力：11月30日9時から12月20日16時まで アルファード30 免責 ワイド"><button class="mic" id="hkMic" title="音声入力">🎤</button><button class="bs" id="hkApply">反映</button></div>
+      <div id="hkVoiceMsg" class="hint"></div>
+      <div class="row"><label class="k">出発</label><input type="date" id="hkSd"><select id="hkSt">${timeOpts}</select></div>
+      <div class="row"><label class="k">返却</label><input type="date" id="hkEd"><select id="hkEt">${timeOpts}</select></div>
+      <div class="row"><label class="k">車種</label><div class="chips">
+        ${Object.entries(CONFIG.classes).map(([k, c], i) => `<label><input type="radio" name="hkCls" value="${k}" ${i ? '' : 'checked'}> ${c.label.replace(/（.*）/, '')}</label>`).join('')}
+      </div></div>
+      <div class="row"><label class="k">補償</label><div class="chips">${CONFIG.options.filter((o) => o.group === 'hosho').map(chk).join('')}</div></div>
+      <div class="row"><label class="k">他</label><div class="chips">${CONFIG.options.filter((o) => o.group === 'opt').map(chk).join('')}</div></div>
+      <div id="hkQuote"><div class="hint">日時と車種を選ぶと金額が出ます</div></div>
+
+      <div class="sec" id="hkSec2" hidden>
+        <h4>② お客様情報</h4>
+        <div class="row"><label class="k">電話</label><input type="tel" id="hkTelNo" placeholder="090-1234-5678"><button class="bs" id="hkSearch">会員検索</button></div>
+        <div id="hkMemOut"></div>
+        <div id="hkNew">
+          <div class="row"><label class="k">お名前</label><input type="text" id="hkN1" placeholder="姓"><input type="text" id="hkN2" placeholder="名"></div>
+          <div class="row"><label class="k">フリガナ</label><input type="text" id="hkK1" placeholder="セイ"><input type="text" id="hkK2" placeholder="メイ"></div>
+        </div>
+        <div class="row"><label class="k">メール</label><input type="email" id="hkMail" placeholder="example@mail.com"></div>
+
+        <h4>③ Rensapoに入力</h4>
+        <div class="row"><label class="k">担当</label><select id="hkStaff" style="flex:1"></select></div>
+        <button class="b2 wide" id="hkF">Rensapoに入力する</button>
+        <div id="hkLog" style="margin-top:6px;font-size:13px"></div>
+      </div>
     </div>`;
   document.body.appendChild(box);
+  const q = (s) => box.querySelector(s);
+  q('#hkMin').onclick = () => box.classList.toggle('min');
+
+  // 初期値：明日 10:00 〜 明後日 10:00
+  const d1 = new Date(); d1.setDate(d1.getDate() + 1);
+  const d2 = new Date(); d2.setDate(d2.getDate() + 2);
+  q('#hkSd').value = ymd(d1); q('#hkEd').value = ymd(d2);
+  q('#hkSt').value = '10:00'; q('#hkEt').value = '10:00';
+  q('#hkSd').min = ymd(new Date());
 
   // 受付担当：Rensapo側のリストは後から読み込まれることがあるので、開くたびに作り直す
-  const staffSel = box.querySelector('#hkStaff');
+  const staffSel = q('#hkStaff');
   function refreshStaff() {
     const keep = staffSel.value || store.get('hkStaff') || '';
     const src = [...document.querySelectorAll('#BookingReserveUserId option')];
     staffSel.innerHTML = '';
-    if (!src.length) { const x = document.createElement('option'); x.value = ''; x.textContent = '（Rensapoの受付配車担当を使う）'; staffSel.appendChild(x); return; }
+    if (!src.length) { staffSel.innerHTML = '<option value="">（Rensapoの受付配車担当を使う）</option>'; return; }
     src.forEach((o) => { const x = document.createElement('option'); x.value = o.value; x.textContent = o.text.trim(); staffSel.appendChild(x); });
     if ([...staffSel.options].some((o) => o.value === keep)) staffSel.value = keep;
   }
@@ -286,78 +267,239 @@
   ['mousedown', 'focus'].forEach((ev) => staffSel.addEventListener(ev, refreshStaff));
   setTimeout(refreshStaff, 1500); setTimeout(refreshStaff, 4000);
   staffSel.onchange = () => store.set('hkStaff', staffSel.value);
-  box.querySelector('#hkMin').onclick = () => box.classList.toggle('min');
 
-  let state = null;
-  const out = box.querySelector('#hkOut'), logEl = box.querySelector('#hkLog'), fBtn = box.querySelector('#hkF');
-  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  const log = (t) => { logEl.innerHTML += `<div>${esc(t)}</div>`; };
-
-  box.querySelector('#hkQ').onclick = async () => {
-    state = null; fBtn.disabled = true; logEl.innerHTML = ''; out.innerHTML = '計算中…';
+  // ===== ① 見積もり（選ぶたびに自動計算） =====
+  let current = null; // { p, qt }
+  let seq = 0, timer = null;
+  function readForm() {
+    const opts = {};
+    box.querySelectorAll('[data-opt]').forEach((e) => { opts[e.dataset.opt] = e.type === 'checkbox' ? (e.checked ? 1 : 0) : Number(e.value); });
+    return {
+      start: { date: q('#hkSd').value, time: q('#hkSt').value },
+      end: { date: q('#hkEd').value, time: q('#hkEt').value },
+      cls: (box.querySelector('input[name=hkCls]:checked') || {}).value,
+      opts
+    };
+  }
+  async function runQuote() {
+    const my = ++seq;
+    const p = readForm();
+    const out = q('#hkQuote');
+    const warn = [];
+    if (!p.start.date || !p.end.date) { out.innerHTML = '<div class="hint">日付を選んでください</div>'; return; }
+    if (p.start.date + p.start.time >= p.end.date + p.end.time) { out.innerHTML = '<div class="warn">⚠ 返却日時が出発日時より前です</div>'; current = null; q('#hkSec2').hidden = true; return; }
+    [['出発', p.start.time], ['返却', p.end.time]].forEach(([lb, t]) => { if (t > CONFIG.pickupLast) warn.push(`${lb} ${t} は送迎最終（${CONFIG.pickupLast}）より後です`); });
+    out.innerHTML = '<div class="hint">計算中…</div>';
     try {
-      const p = parse(box.querySelector('#hkIn').value);
-      if (!p.start || !p.end || !p.start.time || !p.end.time || !p.cls || !p.tel) {
-        out.innerHTML = p.warn.map((w) => `<div class="warn">⚠ ${esc(w)}</div>`).join('');
-        return;
-      }
-      const [qt, members] = await Promise.all([quote(p), memberSearch(p.tel)]);
-      let mHtml;
-      if (members.length > CONFIG.manyHits) {
-        mHtml = `<div class="warn">⚠ この電話番号は ${members.length} 件の会員に登録されています（会社・店舗の番号の可能性）。新規として入力します。リピーター様の場合は携帯番号で検索し直してください。</div>`;
-      } else if (members.length) {
-        // 名前（カナ）が一致する会員を優先して選ぶ
-        const kana = hira2kata(((p.name1 || '') + (p.name2 || '')).replace(/\s/g, ''));
-        const sorted = members.slice().sort((a, b) => {
-          const ma = kana && a.label.replace(/\s/g, '').startsWith(kana) ? 1 : 0;
-          const mb = kana && b.label.replace(/\s/g, '').startsWith(kana) ? 1 : 0;
-          return mb - ma || b.id - a.id;
-        });
-        const opts = sorted.map((m) => `<option value="${m.id}">${esc(m.label)}（ID ${m.id}）</option>`).join('');
-        mHtml = `<div class="ok">✔ リピーター様です${members.length > 1 ? `（${members.length}件ヒット・重複登録の可能性。正しい方を選んでください）` : ''}</div>
-          <select id="hkMem">${opts}<option value="">→ 新規として入力する</option></select>`;
-      } else {
-        mHtml = `<div>新規のお客様（会員ヒットなし）</div>` + (p.name1 ? '' : `<div class="warn">⚠ お名前が読み取れません</div>`);
-      }
+      const qt = await quote(p);
+      if (my !== seq) return;
+      current = { p, qt };
       out.innerHTML = `
         <table>
-          <tr><td>出発</td><td>${p.start.date} ${p.start.time}</td></tr>
-          <tr><td>返却</td><td>${p.end.date} ${p.end.time}</td></tr>
-          <tr><td>車種</td><td>${esc(qt.className)}</td></tr>
-          <tr><td>お名前</td><td>${esc((p.name1 || '') + ' ' + (p.name2 || ''))}</td></tr>
-          <tr><td>電話</td><td>${p.tel}</td></tr>
-          <tr><td>基本料金</td><td>${yen(qt.base)}</td></tr>
-          ${qt.lines.map((l) => `<tr><td>${esc(l.label)}${l.n > 1 ? '×' + l.n : ''}</td><td>${yen(l.price)}</td></tr>`).join('')}
-          <tr><td class="tot">合計（税込）</td><td class="tot">${yen(qt.total)}</td></tr>
+          <tr><td>基本料金（${esc(qt.className)}）</td><td>${yen(qt.base)}</td></tr>
+          ${qt.lines.map((l) => `<tr><td>${esc(l.label)}${l.n > 1 ? ' ×' + l.n : ''}</td><td>${yen(l.price)}</td></tr>`).join('')}
+          <tr class="tot"><td>合計（税込）</td><td>${yen(qt.total)}</td></tr>
         </table>
-        ${mHtml}
-        ${p.warn.map((w) => `<div class="warn">⚠ ${esc(w)}</div>`).join('')}
-        <div class="hint">↑ お客様には「合計 ${yen(qt.total)}」とお伝えください</div>`;
-      state = { p, qt };
-      fBtn.disabled = false;
+        ${warn.map((w) => `<div class="warn">⚠ ${esc(w)}</div>`).join('')}
+        <div class="hint">お客様にこの金額をお伝えください。ご予約になる場合は ② へ</div>`;
+      q('#hkSec2').hidden = false;
     } catch (e) {
+      if (my !== seq) return;
+      current = null;
       out.innerHTML = `<div class="warn">⚠ ${esc(e.message)}</div>`;
+      q('#hkSec2').hidden = true;
     }
-  };
+  }
+  const schedule = () => { clearTimeout(timer); timer = setTimeout(runQuote, 300); };
+  q('#hkSd').addEventListener('change', () => { if (q('#hkEd').value < q('#hkSd').value) q('#hkEd').value = q('#hkSd').value; q('#hkEd').min = q('#hkSd').value; schedule(); });
+  ['#hkSt', '#hkEd', '#hkEt'].forEach((s) => q(s).addEventListener('change', schedule));
+  box.querySelectorAll('input[name=hkCls],[data-opt]').forEach((e) => e.addEventListener('change', schedule));
+  schedule();
 
-  fBtn.onclick = async () => {
-    if (!state) return;
-    // ツールで選んでいなければ、Rensapo画面の受付配車担当をそのまま使う
-    const staffId = staffSel.value || $('#BookingReserveUserId').val() || '';
-    if (!staffId) { alert('受付担当を選んでください（ツールまたはRensapoの「受付配車担当」で選べます）'); return; }
-    fBtn.disabled = true; logEl.innerHTML = '入力中…（触らずにお待ちください）';
+  // ===== 音声・文章から ① の欄を埋める =====
+  // 漢数字（〜九十九）を数字に
+  function kanji2num(str) {
+    const d = { '〇': 0, '零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+    return str.replace(/[〇零一二三四五六七八九十]+/g, (m) => {
+      if (!m.includes('十')) return m.split('').map((c) => d[c]).join('');
+      const [a, b] = m.split('十');
+      return String((a ? d[a] : 1) * 10 + (b ? d[b] : 0));
+    });
+  }
+  function parseVoice(text) {
+    const warn = [];
+    let s = kanji2num(String(text).normalize('NFKC')).replace(/\s+/g, ' ');
+    const r = { warn, opts: {} };
+    // 日付＋時刻：11月30日9時 / 11/30 9:30 / 11月30日 午後4時半
+    const re = /(\d{1,2})\s*[\/月]\s*(\d{1,2})\s*日?\s*(?:の)?\s*(午前|午後|夕方|朝)?\s*(?:(\d{1,2})\s*(?::\s*(\d{2})|時\s*(半|\d{1,2}(?=\s*分))?\s*分?))?/g;
+    const found = []; let m;
+    while ((m = re.exec(s)) && found.length < 2) {
+      let h = m[4] != null ? Number(m[4]) : null, min = 0;
+      if (m[5]) min = Number(m[5]); else if (m[6] === '半') min = 30; else if (m[6]) min = Number(m[6]);
+      if (h != null && (m[3] === '午後' || m[3] === '夕方') && h < 12) h += 12;
+      else if (h != null && !m[3] && h < 8) { warn.push(`${h}時 → ${h + 12}時 と解釈しました`); h += 12; }
+      found.push({ mo: Number(m[1]), d: Number(m[2]), h, min, raw: m[0] });
+    }
+    found.forEach((f) => { s = s.replace(f.raw, ' '); });
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    let y = today.getFullYear();
+    found.forEach((f, i) => {
+      if (i === 0 && new Date(y, f.mo - 1, f.d) < today) y += 1;           // 過ぎた日付は来年
+      if (i === 1 && f.mo < found[0].mo) y += 1;                           // 年をまたぐ返却
+      f.date = `${y}-${pad(f.mo)}-${pad(f.d)}`;
+      f.time = f.h != null ? `${pad(f.h)}:${pad(f.min)}` : '';
+    });
+    if (found[0]) r.start = found[0];
+    if (found[1]) r.end = found[1];
+    // 車種
+    if (/W4Z|新型|40系|アルファード\s*Z|アルファード\s*40|40\s*アルファード/i.test(s)) r.cls = 'W4Z';
+    else if (/W3|30系|アルファード\s*30|30\s*アルファード/i.test(s)) r.cls = 'W3';
+    else if (/アルファード/.test(s)) { r.cls = 'W3'; warn.push('型式がないので 30系 にしました'); }
+    // 補償・オプション（「ワイド免責」はワイドだけ）
+    const t = s.replace(/ワイド\s*(免責|面積)/g, 'ワイド');
+    if (/ワイド/.test(t)) r.opts.wide = 1;
+    if (/免責|面積|めんせき/.test(t)) r.opts.menseki = 1;
+    if (/入替|入れ替え|入れ替|いれかえ|安心/.test(t)) r.opts.irekae = 1;
+    if (/ETC|イーティーシー/i.test(t)) r.opts.etc = 1;
+    if (/KEP|ケップ/i.test(t)) r.opts.kep = 1;
+    [['child', 'チャイルド'], ['baby', 'ベビー'], ['junior', 'ジュニア']].forEach(([k, w]) => {
+      const mm = t.match(new RegExp(w + '[^\\d\\s]*\\s*(\\d)?'));
+      if (mm) r.opts[k] = Math.min(3, Number(mm[1] || 1));
+    });
+    return r;
+  }
+  function applyVoice(text) {
+    const msg = q('#hkVoiceMsg');
+    if (!text.trim()) return;
+    const r = parseVoice(text);
+    const done = [];
+    const setTime = (sel, t, lb) => {
+      if (!t) return;
+      if (TIMES.includes(t)) { q(sel).value = t; } else r.warn.push(`${lb}時刻 ${t} は選べません（9:00〜19:00の30分刻み）`);
+    };
+    if (r.start) { q('#hkSd').value = r.start.date; setTime('#hkSt', r.start.time, '出発'); done.push('出発'); }
+    if (r.end) { q('#hkEd').value = r.end.date; setTime('#hkEt', r.end.time, '返却'); done.push('返却'); }
+    if (r.cls) { const e = box.querySelector(`input[name=hkCls][value=${r.cls}]`); if (e) e.checked = true; done.push('車種'); }
+    // 新しく日付を言ったときは別のお客様とみなし、言わなかった補償・オプションは外す
+    if (Object.keys(r.opts).length || r.start) {
+      box.querySelectorAll('[data-opt]').forEach((e) => {
+        const v = r.opts[e.dataset.opt] || 0;
+        if (e.type === 'checkbox') e.checked = !!v; else e.value = String(v);
+      });
+      if (Object.keys(r.opts).length) done.push('補償・オプション');
+    }
+    if (!done.length) r.warn.push('日付・車種などが読み取れませんでした');
+    msg.innerHTML = (done.length ? `<span class="ok">✔ ${done.join('・')} を反映しました</span>` : '') +
+      r.warn.map((w) => `<div class="warn">⚠ ${esc(w)}</div>`).join('');
+    if (q('#hkEd').value < q('#hkSd').value) q('#hkEd').value = q('#hkSd').value;
+    schedule();
+  }
+  q('#hkApply').onclick = () => applyVoice(q('#hkVoice').value);
+  q('#hkVoice').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); applyVoice(q('#hkVoice').value); } });
+
+  // 音声入力（Chromeの音声認識）
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const mic = q('#hkMic');
+  if (!SR) { mic.disabled = true; mic.title = 'このブラウザは音声入力に対応していません'; }
+  else {
+    let rec = null;
+    mic.onclick = () => {
+      if (rec) { rec.stop(); return; }
+      rec = new SR();
+      rec.lang = 'ja-JP'; rec.interimResults = true; rec.continuous = false;
+      let finalText = '';
+      mic.classList.add('on'); q('#hkVoiceMsg').textContent = '話してください…（もう一度🎤で終了）';
+      rec.onresult = (ev) => {
+        let interim = '';
+        for (let i = ev.resultIndex; i < ev.results.length; i++) {
+          if (ev.results[i].isFinal) finalText += ev.results[i][0].transcript; else interim += ev.results[i][0].transcript;
+        }
+        q('#hkVoice').value = finalText + interim;
+      };
+      rec.onerror = (ev) => {
+        q('#hkVoiceMsg').innerHTML = `<div class="warn">⚠ 音声入力エラー: ${esc(ev.error === 'not-allowed' ? 'マイクの使用が許可されていません（アドレス欄の左のアイコンから許可してください）' : ev.error)}</div>`;
+      };
+      rec.onend = () => {
+        mic.classList.remove('on'); rec = null;
+        if (q('#hkVoice').value.trim()) applyVoice(q('#hkVoice').value);
+      };
+      rec.start();
+    };
+  }
+
+  // ===== ② お客様情報 =====
+  let memberId = '';
+  const memOut = q('#hkMemOut');
+  async function doSearch() {
+    const tel = q('#hkTelNo').value.normalize('NFKC').replace(/\D/g, '');
+    memberId = ''; q('#hkNew').hidden = false;
+    if (tel.length < 10) { memOut.innerHTML = '<div class="warn">⚠ 電話番号を10桁以上で入れてください</div>'; return; }
+    memOut.innerHTML = '<div class="hint">検索中…</div>';
     try {
-      const memSel = box.querySelector('#hkMem');
-      const memberId = memSel ? memSel.value : '';
+      const members = await memberSearch(tel);
+      if (members.length > CONFIG.manyHits) {
+        memOut.innerHTML = `<div class="warn">⚠ この番号は ${members.length} 件の会員に登録されています（会社・店舗の番号の可能性）。新規として入力します。リピーター様なら携帯番号で検索し直してください。</div>`;
+      } else if (members.length) {
+        const opts = members.slice().sort((a, b) => b.id - a.id).map((m) => `<option value="${m.id}">${esc(m.label)}（ID ${m.id}）</option>`).join('');
+        memOut.innerHTML = `<div class="ok">✔ リピーター様です${members.length > 1 ? `（${members.length}件。正しい方を選んでください）` : ''}</div>
+          <select id="hkMem" style="width:100%">${opts}<option value="">→ 新規として入力する</option></select>
+          <div class="hint">会員情報（名前など）は自動で入ります。メールが変わっていれば下に入れてください。</div>`;
+        const sel = q('#hkMem');
+        const apply = () => { memberId = sel.value; q('#hkNew').hidden = !!memberId; };
+        sel.onchange = apply; apply();
+      } else {
+        memOut.innerHTML = '<div>新規のお客様です（会員ヒットなし）。お名前とフリガナを入れてください。</div>';
+      }
+    } catch (e) {
+      memOut.innerHTML = `<div class="warn">⚠ 会員検索でエラー: ${esc(e.message)}</div>`;
+    }
+  }
+  q('#hkSearch').onclick = doSearch;
+  q('#hkTelNo').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
+  q('#hkTelNo').addEventListener('blur', () => { const t = q('#hkTelNo').value.replace(/\D/g, ''); if (t.length >= 10 && !memOut.innerHTML) doSearch(); });
+  q('#hkTelNo').addEventListener('input', () => { memOut.innerHTML = ''; memberId = ''; q('#hkNew').hidden = false; });
+  // 名前がカナならフリガナにも入れる／フリガナはカタカナにそろえる
+  [['#hkN1', '#hkK1'], ['#hkN2', '#hkK2']].forEach(([n, k]) => {
+    q(n).addEventListener('change', () => { const v = q(n).value.trim(); if (isKana(v) && !q(k).value) q(k).value = hira2kata(v); });
+    q(k).addEventListener('change', () => { q(k).value = hira2kata(q(k).value.trim()); });
+  });
+
+  // ===== ③ Rensapoに入力 =====
+  const logEl = q('#hkLog');
+  const log = (t) => { logEl.innerHTML += `<div>${esc(t)}</div>`; };
+  q('#hkF').onclick = async () => {
+    if (!current) { alert('先に ① の見積もりを出してください'); return; }
+    const tel = q('#hkTelNo').value.normalize('NFKC').replace(/\D/g, '');
+    const email = q('#hkMail').value.normalize('NFKC').trim();
+    const cust = {
+      memberId, tel, email,
+      name1: q('#hkN1').value.trim(), name2: q('#hkN2').value.trim(),
+      kana1: hira2kata(q('#hkK1').value.trim()), kana2: hira2kata(q('#hkK2').value.trim())
+    };
+    const errs = [];
+    if (tel.length < 10) errs.push('電話番号');
+    if (!memberId) {
+      if (!cust.name1) errs.push('お名前（姓）');
+      if (!cust.kana1) errs.push('フリガナ（セイ）');
+    }
+    if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) errs.push('メールアドレスの形');
+    if (errs.length) { alert('次を確認してください：\n・' + errs.join('\n・')); return; }
+    const staffId = staffSel.value || $('#BookingReserveUserId').val() || '';
+    if (!staffId) { alert('受付担当を選んでください'); return; }
+
+    // 入力直前に見積もりを取り直して、最新の金額で入れる
+    const btn = q('#hkF'); btn.disabled = true; logEl.innerHTML = '入力中…（20秒ほど触らずにお待ちください）';
+    try {
+      const qt = await quote(current.p);
       logEl.innerHTML = '';
-      const r = await fillRensapo(state.p, state.qt, memberId, staffId, log);
-      if (r.got === state.qt.total) log(`✔ Rensapoの合計 ${yen(r.got)} がお客様画面と一致しました`);
-      else log(`⚠ Rensapoの合計が ${yen(r.got)} です（見積もり ${yen(state.qt.total)}）。料金欄を確認してください`);
-      log('内容を確認し、問題なければ画面下の「登録する」を押してください。');
+      const r = await fillRensapo(current.p, qt, cust, staffId, log);
+      if (r.got === qt.total) log(`✔ Rensapoの合計 ${yen(r.got)} がお客様画面と一致しました`);
+      else log(`⚠ Rensapoの合計が ${yen(r.got)} です（見積もり ${yen(qt.total)}）。料金欄を確認してください`);
+      log('内容（特に貸渡車両）を確認し、問題なければ画面下の「登録する」を押してください。');
     } catch (e) {
       log('⚠ エラー: ' + e.message);
     } finally {
-      fBtn.disabled = false;
+      btn.disabled = false;
     }
   };
 })();
